@@ -1,0 +1,6 @@
+{
+  "name": "Gestor de Tarefas em Tempo Real",
+  "description": "Uma plataforma de gestão de tarefas (Task Manager) colaborativa com estados em tempo real baseada em Firebase Firestore e Authentication.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

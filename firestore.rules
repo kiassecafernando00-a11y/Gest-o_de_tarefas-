@@ -1,0 +1,162 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 1. Global Safety Net - Catch-all default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- REUSABLE SECURITY UTILITIES ---
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Helper to evaluate if the requester is project owner or project member
+    function isProjectMember(projectId) {
+      return isSignedIn() && (
+        get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid ||
+        request.auth.uid in get(/databases/$(database)/documents/projects/$(projectId)).data.members
+      );
+    }
+
+    // --- COLLECTION RULES ---
+
+    // 2. Users Collection
+    match /users/{userId} {
+      function isValidUser(data) {
+        return data.keys().hasAll(['id', 'name', 'email', 'avatarUrl', 'updatedAt'])
+          && data.keys().size() == 5
+          && data.id == request.auth.uid
+          && data.name is string && data.name.size() > 0 && data.name.size() <= 150
+          && data.email is string && data.email.size() <= 200
+          && data.avatarUrl is string && data.avatarUrl.size() <= 500;
+      }
+
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if isSignedIn() && userId == request.auth.uid && isValidUser(incoming()) && incoming().updatedAt == request.time;
+      allow update: if isSignedIn() && userId == request.auth.uid && isValidUser(incoming()) && incoming().updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    // 3. Projects Collection
+    match /projects/{projectId} {
+      function isValidProject(data) {
+        return data.keys().hasAll(['id', 'name', 'description', 'ownerId', 'members', 'createdAt', 'updatedAt'])
+          && data.keys().size() == 7
+          && data.id is string && data.id.size() <= 128
+          && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+          && data.description is string && data.description.size() <= 500
+          && data.ownerId == request.auth.uid
+          && data.members is list && data.members.size() <= 100
+          && (data.members.size() == 0 || data.members[0] is string);
+      }
+
+      allow get: if isSignedIn() && (existing().ownerId == request.auth.uid || request.auth.uid in existing().members);
+      // Explicitly secure list query against resource's own fields to prevent blanket queries
+      allow list: if isSignedIn() && (resource.data.ownerId == request.auth.uid || request.auth.uid in resource.data.members);
+
+      allow create: if isSignedIn() && isValidId(projectId) && isValidProject(incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time;
+      
+      allow update: if isSignedIn() && isValidId(projectId) && isValidProject(incoming())
+        && (existing().ownerId == request.auth.uid) // Only project owner can edit project settings/members
+        && incoming().createdAt == existing().createdAt
+        && incoming().ownerId == existing().ownerId
+        && incoming().updatedAt == request.time;
+
+      allow delete: if isSignedIn() && isValidId(projectId) && (existing().ownerId == request.auth.uid);
+
+      // 4. Tasks Subcollection
+      match /tasks/{taskId} {
+        function isValidTask(data) {
+          return data.keys().hasAll(['id', 'projectId', 'title', 'description', 'status', 'priority', 'createdBy', 'createdAt', 'updatedAt'])
+            && (data.keys().size() >= 9 && data.keys().size() <= 12)
+            && data.id is string && data.id.size() <= 128
+            && data.projectId == projectId
+            && data.title is string && data.title.size() > 0 && data.title.size() <= 200
+            && data.description is string && data.description.size() <= 2000
+            && (data.status == 'todo' || data.status == 'in_progress' || data.status == 'review' || data.status == 'done')
+            && (data.priority == 'low' || data.priority == 'medium' || data.priority == 'high')
+            && data.createdBy is string && data.createdBy.size() <= 128
+            && (!('assigneeId' in data) || data.assigneeId is string && data.assigneeId.size() <= 128)
+            && (!('dueDate' in data) || data.dueDate is string && data.dueDate.size() <= 128)
+            && (!('tags' in data) || (data.tags is list && data.tags.size() <= 10 && (data.tags.size() == 0 || data.tags[0] is string)));
+        }
+
+        allow get: if isProjectMember(projectId);
+        allow list: if isProjectMember(projectId);
+
+        allow create: if isProjectMember(projectId) && isValidId(taskId) && isValidTask(incoming())
+          && incoming().createdBy == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        // Named actions using || and affectedKeys
+        allow update: if isProjectMember(projectId) && isValidId(taskId) && isValidTask(incoming())
+          && incoming().createdBy == existing().createdBy
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            // Action 1: Owner/Creator can update all non-immutable details
+            (existing().createdBy == request.auth.uid || get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid) ||
+            // Action 2: Custom Assignee can ONLY update the task status in progress/done
+            (incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+          );
+
+        allow delete: if isProjectMember(projectId) && isValidId(taskId)
+          && (existing().createdBy == request.auth.uid || get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid);
+
+        // 5. Comments Nested Subcollection
+        match /comments/{commentId} {
+          function isValidComment(data) {
+            return data.keys().hasAll(['id', 'taskId', 'userId', 'userName', 'userPhoto', 'text', 'createdAt'])
+              && data.keys().size() == 7
+              && data.id is string && data.id.size() <= 128
+              && data.taskId == taskId
+              && data.userId == request.auth.uid
+              && data.userName is string && data.userName.size() <= 200
+              && data.userPhoto is string && data.userPhoto.size() <= 500
+              && data.text is string && data.text.size() > 0 && data.text.size() <= 1000;
+          }
+
+          allow read, list: if isProjectMember(projectId);
+          allow create: if isProjectMember(projectId) && isValidId(commentId) && isValidComment(incoming()) && incoming().createdAt == request.time;
+          allow update: if false; // Comments are immutable
+          allow delete: if isProjectMember(projectId) && (existing().userId == request.auth.uid || get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid);
+        }
+      }
+
+      // 6. Project Activities Subcollection
+      match /activities/{activityId} {
+        function isValidActivity(data) {
+          return data.keys().hasAll(['id', 'userId', 'userName', 'userPhoto', 'action', 'details', 'createdAt'])
+            && data.keys().size() == 7
+            && data.id is string && data.id.size() <= 128
+            && data.userId == request.auth.uid
+            && data.userName is string && data.userName.size() <= 200
+            && data.userPhoto is string && data.userPhoto.size() <= 500
+            && data.action is string && data.action.size() <= 128
+            && data.details is string && data.details.size() <= 1000;
+        }
+
+        allow read, list: if isProjectMember(projectId);
+        allow create: if isProjectMember(projectId) && isValidId(activityId) && isValidActivity(incoming()) && incoming().createdAt == request.time;
+        allow update, delete: if false; // Audit logs are strictly immutable
+      }
+    }
+  }
+}
